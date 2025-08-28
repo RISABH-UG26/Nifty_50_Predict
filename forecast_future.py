@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 # --- Step 1: Load the Dataset ---
 print("Loading the dataset...")
@@ -15,7 +16,7 @@ except FileNotFoundError:
 # --- Step 2: Ensure Data is Numeric ---
 print("Ensuring all feature columns are numeric...")
 for col in df.columns:
-    if col != 'Target_VIX': # Exclude the target column for now
+    if col != 'Target_VIX':
         df[col] = pd.to_numeric(df[col], errors='coerce')
 df.dropna(inplace=True)
 
@@ -42,46 +43,45 @@ print("Model training complete.")
 # --- Step 5: Generate Future Predictions ---
 print("\nGenerating future forecast...")
 N_FORECAST_DAYS = 30
-last_known_data = features.iloc[[-1]] # Get the very last row of data
+last_known_data = features.iloc[[-1]]
 future_predictions = []
 
 for _ in range(N_FORECAST_DAYS):
-    # Predict the next day
     next_day_pred = final_model.predict(last_known_data)[0]
     future_predictions.append(next_day_pred)
     
-    # --- Update the last_known_data for the next prediction ---
-    # Create a new row for the next day
     new_row = last_known_data.iloc[0].copy()
-    
-    # We need to update the features based on our prediction.
-    # For simplicity, we'll update the most direct features.
-    # A more complex model would update rolling averages, etc.
-    new_row['VIX_Close'] = next_day_pred # The new "known" VIX is our prediction
-    
-    # We can assume other features (like returns) might revert to their mean, or stay flat.
-    # Here, we will keep them constant from the last day for this forecast.
+    new_row['VIX_Close'] = next_day_pred
     
     last_known_data = pd.DataFrame([new_row])
 
-
 # --- Step 6: Create and Plot the Future Graph ---
-# Create future dates for the x-axis of our plot
-last_date = df.index[-1]
-future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=N_FORECAST_DAYS)
+historical_vix = df['VIX_Close'][-200:]
+future_vix = pd.Series(future_predictions)
 
-# Combine historical and future data for plotting
-historical_vix = df['VIX_Close']
-future_vix = pd.Series(future_predictions, index=future_dates)
+# **THE FIX: Create simple numerical ranges for plotting**
+historical_x = np.arange(len(historical_vix))
+future_x = np.arange(len(historical_vix), len(historical_vix) + N_FORECAST_DAYS)
 
 plt.style.use('seaborn-v0_8-darkgrid')
 plt.figure(figsize=(15, 7))
-plt.plot(historical_vix.index[-200:], historical_vix[-200:], label='Historical Actual VIX', color='blue')
-plt.plot(future_vix.index, future_vix, label='Future Predicted VIX', color='red', linestyle='--')
+
+# Plot data using the numerical index
+plt.plot(historical_x, historical_vix.values, label='Historical Actual VIX', color='blue')
+plt.plot(future_x, future_vix.values, label='Future Predicted VIX', color='red', linestyle='--')
+
+# Manually add a few date labels to the x-axis for context
+all_dates = pd.date_range(start=historical_vix.index[0], periods=len(historical_x) + len(future_x))
+tick_positions = np.linspace(0, len(historical_x) + len(future_x) - 1, 10, dtype=int)
+tick_labels = [all_dates[i].strftime('%Y-%m-%d') for i in tick_positions]
+
+plt.xticks(ticks=tick_positions, labels=tick_labels, rotation=45, ha="right")
+
 plt.title('Nifty VIX: Historical Data and 30-Day Future Forecast', fontsize=16)
 plt.xlabel('Date', fontsize=12)
 plt.ylabel('VIX Value', fontsize=12)
 plt.legend()
+plt.tight_layout() # Adjust layout to make sure everything fits
 plt.show()
 
 print("\nForecast complete. A plot showing the future prediction has been generated.")
