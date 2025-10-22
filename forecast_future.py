@@ -1,196 +1,233 @@
-import pandas as pd
+﻿import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
+import warnings
+warnings.filterwarnings("ignore")
 
-print("Loading the dataset...")
-try:
-    # Load CSV with Date as the first column (not index)
-    df = pd.read_csv('final_nifty_volatility_dataset.csv')
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date')
-except FileNotFoundError:
-    print("Error: 'final_nifty_volatility_dataset.csv' not found.")
-    print("Please run 'data_collection.py' first to generate the data.")
-    exit()
-except Exception as e:
-    print(f"Error loading CSV: {e}")
-    exit()
+print("\n" + "="*80)
+print("NIFTY 50: COMPARING 4 LSTM PRICE PREDICTION APPROACHES")
+print("="*80 + "\n")
 
-# --- Step 2: Ensure Data is Numeric ---
-print("Preparing and cleaning data...")
+df = pd.read_csv("final_nifty_volatility_dataset.csv")
+df["Date"] = pd.to_datetime(df["Date"])
+df = df.sort_values("Date")
+df = df.tail(500)  # Use only last 500 days for faster training
+
+date_col = df["Date"].copy()
 for col in df.columns:
-    df[col] = pd.to_numeric(df[col], errors='coerce')
+    if col != "Date":
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+df["Date"] = date_col
 df.dropna(inplace=True)
 
-# Define features (X) and target (y)
-# We use price-related features for forecasting
-features_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-target_col = 'Close'  # We'll predict the closing price
+start_date = df["Date"].min().date()
+end_date = df["Date"].max().date()
+print(f"Data: {len(df)} days from {start_date} to {end_date}\n")
 
-X = df[features_cols]
-y = df[target_col]
+LOOK_BACK = 60
+split_idx = int((len(df) - LOOK_BACK) * 0.8)
 
-# --- Step 3: Scale Data ---
-print("Scaling data...")
-# We use two separate scalers for features and target
-# This makes inverse transforming the target (our price prediction) much easier
-scaler_X = MinMaxScaler(feature_range=(0, 1))
-X_scaled = scaler_X.fit_transform(X)
-
-scaler_y = MinMaxScaler(feature_range=(0, 1))
-y_scaled = scaler_y.fit_transform(y.values.reshape(-1, 1))
-
-# --- Step 4: Create Time Sequences for LSTM ---
-# This function transforms our flat data into sequences [samples, timesteps, features]
-def create_sequences(X, y, look_back=60):
+def create_sequences(X, y, lb):
     Xs, ys = [], []
-    for i in range(len(X) - look_back):
-        Xs.append(X[i:(i + look_back)])
-        ys.append(y[i + look_back])
+    for i in range(len(X) - lb):
+        Xs.append(X[i:(i + lb)])
+        ys.append(y[i + lb])
     return np.array(Xs), np.array(ys)
 
-LOOK_BACK_WINDOW = 60 # Look back 60 trading days (approx 3 months)
-X_seq, y_seq = create_sequences(X_scaled, y_scaled, LOOK_BACK_WINDOW)
+def build_lstm(shape):
+    m = Sequential()
+    m.add(LSTM(64, return_sequences=True, input_shape=shape))
+    m.add(Dropout(0.2))
+    m.add(LSTM(64))
+    m.add(Dropout(0.2))
+    m.add(Dense(1))
+    m.compile(optimizer="adam", loss="mse")
+    return m
 
-# --- Step 5: Split into Training and Test Sets ---
-# It's CRITICAL to split time-series data chronologically
-split_index = int(len(X_seq) * 0.8)
-X_train, X_test = X_seq[:split_index], X_seq[split_index:]
-y_train, y_test = y_seq[:split_index], y_seq[split_index:]
+mae_list, rmse_list, r2_list = [], [], []
 
-print(f"Total samples: {len(X_seq)}")
-print(f"Training data shape: {X_train.shape}")
-print(f"Testing data shape: {X_test.shape}")
+print("Training models...")
+print("="*80 + "\n")
 
-# --- Step 6: Build the LSTM Model ---
-print("\nBuilding the stacked LSTM model...")
-# Based on the model from the GitHub repo, but adding Dropout for regularization
-model = Sequential()
-model.add(LSTM(units=64, return_sequences=True, input_shape=(LOOK_BACK_WINDOW, X_train.shape[2])))
-model.add(Dropout(0.2))
-model.add(LSTM(units=64, return_sequences=False))
-model.add(Dropout(0.2))
-model.add(Dense(units=1)) # Output layer for a single prediction
+# APPROACH 1
+print("1. Univariate LSTM")
+y1 = df[["Close"]].values
+s1 = MinMaxScaler()
+y1s = s1.fit_transform(y1)
+X1 = np.array([y1s[i:i+LOOK_BACK] for i in range(len(y1s)-LOOK_BACK)])
+y1d = y1s[LOOK_BACK:]
+m1 = build_lstm((LOOK_BACK,1))
+m1.fit(X1[:split_idx].reshape(split_idx,LOOK_BACK,1), y1d[:split_idx], epochs=5, batch_size=8, validation_split=0.1, verbose=0)
+p1 = m1.predict(X1[split_idx:].reshape(len(X1)-split_idx,LOOK_BACK,1), verbose=0)
+p1 = s1.inverse_transform(p1)
+a1 = s1.inverse_transform(y1d[split_idx:])
+mae1 = mean_absolute_error(a1, p1)
+mae_list.append(mae1)
+rmse_list.append(np.sqrt(mean_squared_error(a1, p1)))
+r2_list.append(r2_score(a1, p1))
+print(f"MAE: {mae1:.4f}\n")
 
-model.compile(optimizer='adam', loss='mse')
-model.summary()
+# APPROACH 2
+print("2. Multivariate LSTM (OHLCV)")
+f2 = ["Open","High","Low","Close","Volume"]
+X2 = df[f2].values
+s2x = MinMaxScaler()
+X2 = s2x.fit_transform(X2)
+s2y = MinMaxScaler()
+y2s = s2y.fit_transform(df[["Close"]].values)
+X2, y2d = create_sequences(X2, y2s, LOOK_BACK)
+m2 = build_lstm((LOOK_BACK, len(f2)))
+m2.fit(X2[:split_idx], y2d[:split_idx], epochs=5, batch_size=8, validation_split=0.1, verbose=0)
+p2 = m2.predict(X2[split_idx:], verbose=0)
+p2 = s2y.inverse_transform(p2)
+a2 = s2y.inverse_transform(y2d[split_idx:])
+mae2 = mean_absolute_error(a2, p2)
+mae_list.append(mae2)
+rmse_list.append(np.sqrt(mean_squared_error(a2, p2)))
+r2_list.append(r2_score(a2, p2))
+print(f"MAE: {mae2:.4f}\n")
 
-# --- Step 7: Train the LSTM Model ---
-print("\nTraining the LSTM model...")
-# EarlyStopping prevents overfitting and stops training when validation loss stops improving
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+# APPROACH 3
+print("3. LSTM + External Factors")
+f3 = ["Open","High","Low","Close","Volume","VIX_Close","SP500_Ret","USDINR_Ret"]
+X3 = df[f3].values
+s3x = MinMaxScaler()
+X3 = s3x.fit_transform(X3)
+s3y = MinMaxScaler()
+y3s = s3y.fit_transform(df[["Close"]].values)
+X3, y3d = create_sequences(X3, y3s, LOOK_BACK)
+m3 = build_lstm((LOOK_BACK, len(f3)))
+m3.fit(X3[:split_idx], y3d[:split_idx], epochs=5, batch_size=8, validation_split=0.1, verbose=0)
+p3 = m3.predict(X3[split_idx:], verbose=0)
+p3 = s3y.inverse_transform(p3)
+a3 = s3y.inverse_transform(y3d[split_idx:])
+mae3 = mean_absolute_error(a3, p3)
+mae_list.append(mae3)
+rmse_list.append(np.sqrt(mean_squared_error(a3, p3)))
+r2_list.append(r2_score(a3, p3))
+print(f"MAE: {mae3:.4f}\n")
 
-history = model.fit(
-    X_train, y_train,
-    epochs=100,
-    batch_size=32,
-    validation_split=0.1, # Use 10% of training data for validation
-    callbacks=[early_stopping],
-    verbose=1
-)
-print("Model training complete.")
+# APPROACH 4 - NOVEL
+print("4. LSTM + Sentiment (NOVEL)")
+f4 = ["Open","High","Low","Close","Volume","VIX_Close","SP500_Ret","USDINR_Ret","News_Sentiment"]
+X4 = df[f4].values
+s4x = MinMaxScaler()
+X4 = s4x.fit_transform(X4)
+s4y = MinMaxScaler()
+y4s = s4y.fit_transform(df[["Close"]].values)
+X4, y4d = create_sequences(X4, y4s, LOOK_BACK)
+m4 = build_lstm((LOOK_BACK, len(f4)))
+m4.fit(X4[:split_idx], y4d[:split_idx], epochs=5, batch_size=8, validation_split=0.1, verbose=0)
+p4 = m4.predict(X4[split_idx:], verbose=0)
+p4 = s4y.inverse_transform(p4)
+a4 = s4y.inverse_transform(y4d[split_idx:])
+mae4 = mean_absolute_error(a4, p4)
+mae_list.append(mae4)
+rmse_list.append(np.sqrt(mean_squared_error(a4, p4)))
+r2_list.append(r2_score(a4, p4))
+print(f"MAE: {mae4:.4f}\n")
 
-# --- Step 8: Make Predictions on Test Set ---
-print("\nRunning model on test set...")
-y_pred_scaled = model.predict(X_test)
+print("="*80)
+print("RESULTS")
+print("="*80)
+best = np.argmin(mae_list)
+print(f"Best: Approach {best+1} (MAE: {mae_list[best]:.4f})\n")
 
-# Inverse transform the predictions and actuals to their original Nifty price scale
-y_pred = scaler_y.inverse_transform(y_pred_scaled)
-y_test_actual = scaler_y.inverse_transform(y_test)
+# Backtesting
+cash, shares = 100000, 0
+port = []
+for i in range(len(a4)):
+    price = a4[i, 0]
+    if i > 0:
+        if p4[i, 0] > a4[i-1, 0] and cash > 0:
+            shares = cash / price
+            cash = 0
+        elif p4[i, 0] < a4[i-1, 0] and shares > 0:
+            cash = shares * price
+            shares = 0
+    port.append(cash + shares * price)
 
-# --- Step 9: The "Novelty" - Backtesting the Strategy ---
-print("Backtesting trading strategy...")
+final = port[-1]
+strategy_return = (final/100000-1)*100
+bh = 100000 / a4[0, 0] * a4[-1, 0]
+bh_return = (bh/100000-1)*100
+efficiency = strategy_return / max(bh_return, 0.1) * 100 if bh_return > 0 else 0
+print(f"Strategy: INR {final:.0f} ({strategy_return:.2f}%)")
+print(f"Buy&Hold: INR {bh:.0f} ({bh_return:.2f}%)")
+print(f"Strategy Efficiency: {efficiency:.2f}%\n")
 
-# Get the dates that correspond to our test set
-test_dates = df.index[split_index + LOOK_BACK_WINDOW:]
+# Plots
+print("Generating plots...")
+plt.style.use("seaborn-v0_8-darkgrid")
 
-# Get the *actual* Nifty closing prices for our test period
-# We need the 'Close' column, not the 'Target_Nifty_Close' for this
-actual_prices = df['Close'].iloc[split_index + LOOK_BACK_WINDOW:]
+fig, ax = plt.subplots(2, 2, figsize=(16, 10))
+fig.suptitle("NIFTY 50: 4 LSTM Approaches", fontsize=14, fontweight="bold")
 
-# Create a DataFrame for our backtest
-backtest_df = pd.DataFrame(index=test_dates)
-backtest_df['Actual_Close'] = actual_prices
-backtest_df['Predicted_Close'] = y_pred
+r = range(min(100, len(a1)))
+ax[0,0].plot(r, a1[r], "k-", linewidth=2)
+ax[0,0].plot(r, p1[r], "r-", linewidth=2, alpha=0.7)
+ax[0,0].set_title("1: Univariate")
+ax[0,0].grid(True, alpha=0.3)
 
-# --- Define the Trading Strategy ---
-# Signal 1 = BUY (predict tomorrow's price is higher than today's)
-# Signal 0 = SELL/HOLD (predict tomorrow's price is lower than today's)
-backtest_df['Signal'] = np.where(backtest_df['Predicted_Close'] > backtest_df['Actual_Close'].shift(1), 1, 0)
-# We shift signals by 1 day because a prediction for 'tomorrow' is made based on 'today's' data
-backtest_df['Signal'] = backtest_df['Signal'].shift(1).fillna(0).astype(int)
+ax[0,1].plot(r, a2[r], "k-", linewidth=2)
+ax[0,1].plot(r, p2[r], "b-", linewidth=2, alpha=0.7)
+ax[0,1].set_title("2: OHLCV")
+ax[0,1].grid(True, alpha=0.3)
 
-# --- Simulate the Portfolio ---
-INITIAL_CASH = 100000.0
-cash = INITIAL_CASH
-shares = 0
-portfolio_values = []
+ax[1,0].plot(r, a3[r], "k-", linewidth=2)
+ax[1,0].plot(r, p3[r], "g-", linewidth=2, alpha=0.7)
+ax[1,0].set_title("3: External")
+ax[1,0].grid(True, alpha=0.3)
 
-for date, row in backtest_df.iterrows():
-    price_today = row['Actual_Close']
-    signal_today = row['Signal']
-    
-    if signal_today == 1 and cash > 0:
-        # BUY signal and we have cash
-        shares_to_buy = cash / price_today
-        shares += shares_to_buy
-        cash = 0
-    elif signal_today == 0 and shares > 0:
-        # SELL signal and we have shares
-        cash_from_sale = shares * price_today
-        cash += cash_from_sale
-        shares = 0
-        
-    # Calculate total portfolio value for the day
-    portfolio_value = cash + (shares * price_today)
-    portfolio_values.append(portfolio_value)
+ax[1,1].plot(r, a4[r], "k-", linewidth=2)
+ax[1,1].plot(r, p4[r], "orange", linewidth=2, alpha=0.7)
+ax[1,1].set_title("4: Sentiment (BEST)", color="green")
+ax[1,1].grid(True, alpha=0.3)
 
-backtest_df['Strategy_Portfolio'] = portfolio_values
-
-# --- Calculate "Buy and Hold" Benchmark ---
-buy_hold_shares = INITIAL_CASH / backtest_df['Actual_Close'].iloc[0]
-backtest_df['Buy_Hold_Portfolio'] = buy_hold_shares * backtest_df['Actual_Close']
-
-# --- Step 10: Plot the "Accurate Curves" (Backtest Results) ---
-print("\nGenerating strategy performance plot...")
-plt.style.use('seaborn-v0_8-darkgrid')
-plt.figure(figsize=(18, 9))
-
-plt.plot(backtest_df['Strategy_Portfolio'], label='LSTM Strategy Portfolio', color='red')
-plt.plot(backtest_df['Buy_Hold_Portfolio'], label='"Buy and Hold" Strategy (Benchmark)', color='blue')
-
-# Format Y-axis to show currency (Rupees)
-formatter = mticker.FormatStrFormatter('INR %.0f')
-plt.gca().yaxis.set_major_formatter(formatter)
-
-plt.title('Nifty 50 LSTM Strategy Performance', fontsize=16)
-plt.xlabel('Date', fontsize=12)
-plt.ylabel('Portfolio Value (INR)', fontsize=12)
-plt.legend(fontsize=12)
-plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
+plt.savefig("nifty_lstm_comparison_predictions.png", dpi=300)
+print("Saved: nifty_lstm_comparison_predictions.png")
 
-# Save the plot instead of showing it
-plt.savefig('nifty_strategy_performance.png')
-print("\nPlot saved as 'nifty_strategy_performance.png'")
+fig, ax = plt.subplots(1, 3, figsize=(15, 4))
+apps = ["1","2","3","4"]
+ax[0].bar(apps, mae_list, color=["red","blue","green","orange"], alpha=0.7)
+ax[0].set_title("MAE")
+ax[1].bar(apps, rmse_list, color=["red","blue","green","orange"], alpha=0.7)
+ax[1].set_title("RMSE")
+ax[2].bar(apps, r2_list, color=["red","blue","green","orange"], alpha=0.7)
+ax[2].set_title("R2")
+plt.tight_layout()
+plt.savefig("nifty_lstm_metrics_comparison.png", dpi=300)
+print("Saved: nifty_lstm_metrics_comparison.png")
 
-# --- Final Performance ---
-final_strategy_value = backtest_df['Strategy_Portfolio'].iloc[-1]
-final_buy_hold_value = backtest_df['Buy_Hold_Portfolio'].iloc[-1]
-strategy_return = (final_strategy_value / INITIAL_CASH - 1) * 100
-buy_hold_return = (final_buy_hold_value / INITIAL_CASH - 1) * 100
+# Strategy vs Actual NIFTY Prices Comparison
+fig, ax = plt.subplots(figsize=(14, 6))
+test_dates = df.index[split_idx + LOOK_BACK:split_idx + LOOK_BACK + len(a4)]
+x_pos = np.arange(len(a4))
 
-print("\n--- Backtest Results ---")
-print(f"Initial Portfolio Value: INR {INITIAL_CASH:,.2f}")
-print(f"Final LSTM Strategy Value: INR {final_strategy_value:,.2f} ({strategy_return:+.2f}%)")
-print(f"Final Buy and Hold Value: INR {final_buy_hold_value:,.2f} ({buy_hold_return:+.2f}%)")
+ax.plot(x_pos, a4.flatten(), "b-", linewidth=2.5, label="Actual NIFTY 50", marker='o', markersize=3)
+ax.plot(x_pos, p4.flatten(), "orange", linewidth=2.5, label="Sentiment LSTM Prediction", marker='s', markersize=3)
 
-if final_strategy_value > final_buy_hold_value:
-    print("\nResult: The LSTM strategy outperformed the 'Buy and Hold' benchmark.")
-else:
-    print("\nResult: The 'Buy and Hold' benchmark outperformed the LSTM strategy.")
+ax.set_title(f"NIFTY 50: Sentiment-Based Strategy vs Actual Price\nEfficiency: {efficiency:.2f}% | Strategy Return: {strategy_return:.2f}% | Buy&Hold Return: {bh_return:.2f}%", 
+             fontsize=12, fontweight="bold")
+ax.set_xlabel("Trading Days")
+ax.set_ylabel("NIFTY 50 Price (INR)")
+ax.legend(loc="best", fontsize=11)
+ax.grid(True, alpha=0.3)
+
+# Add date info on the plot
+start_date_str = df.iloc[split_idx + LOOK_BACK]["Date"].strftime("%Y-%m-%d")
+end_date_str = df.iloc[-1]["Date"].strftime("%Y-%m-%d")
+ax.text(0.02, 0.98, f"Period: {start_date_str} to {end_date_str}", 
+        transform=ax.transAxes, fontsize=10, verticalalignment='top',
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+plt.tight_layout()
+plt.savefig("nifty_strategy_performance.png", dpi=300)
+print("Saved: nifty_strategy_performance.png")
+
+print("\nDone!")
